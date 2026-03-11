@@ -836,19 +836,13 @@ def build_style():
     style.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"))
 
 
-def apply_initial_pane_layout():
-    try:
-        total_width = content_pane.winfo_width() or root.winfo_width()
-        sash_position = max(700, total_width - 315)
-        content_pane.sashpos(0, sash_position)
-    except tk.TclError:
-        return
+RIGHT_PANEL_WIDTH = 320
 
 
 root = tk.Tk()
 root.title("智能 Socks5 二维码生成工具")
 root.geometry("1100x700")
-root.minsize(980, 620)
+root.minsize(1040, 620)
 
 build_style()
 
@@ -872,14 +866,17 @@ ttk.Button(toolbar_frame, text="取消全选", command=deselect_all).pack(side="
 ttk.Button(toolbar_frame, text="删除选中", command=delete_selected).pack(side="left", padx=(8, 0))
 ttk.Button(toolbar_frame, text="导出有效数据", command=export_valid_data).pack(side="left", padx=(8, 0))
 
-content_pane = ttk.Panedwindow(main_frame, orient=tk.HORIZONTAL)
-content_pane.pack(fill="both", expand=True)
+content_frame = ttk.Frame(main_frame, style="App.TFrame")
+content_frame.pack(fill="both", expand=True)
+content_frame.columnconfigure(0, weight=1, minsize=680)
+content_frame.columnconfigure(1, weight=0, minsize=RIGHT_PANEL_WIDTH)
+content_frame.rowconfigure(0, weight=1)
 
-left_panel = ttk.Frame(content_pane, style="App.TFrame")
-right_panel = ttk.Frame(content_pane, style="App.TFrame")
-right_panel.configure(width=300)
-content_pane.add(left_panel, weight=6)
-content_pane.add(right_panel, weight=2)
+left_panel = ttk.Frame(content_frame, style="App.TFrame")
+left_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+
+right_panel = ttk.Frame(content_frame, style="App.TFrame", width=RIGHT_PANEL_WIDTH)
+right_panel.grid(row=0, column=1, sticky="nsew")
 
 input_card = ttk.LabelFrame(left_panel, text="数据输入", style="Card.TLabelframe", padding=10)
 input_card.pack(fill="x")
@@ -977,7 +974,7 @@ table_menu.add_separator()
 table_menu.add_command(label="删除选中", command=delete_selected)
 
 preview_card = ttk.LabelFrame(right_panel, text="二维码预览", style="Card.TLabelframe", padding=12)
-preview_card.pack(fill="x", anchor="n")
+preview_card.pack(fill="both", expand=True, anchor="n")
 
 preview_title_var = tk.StringVar(value="等待选择")
 preview_meta_var = tk.StringVar(value="从左侧列表选择一条数据，再点击“预览二维码”或直接双击。")
@@ -1027,7 +1024,6 @@ status_bar.pack(fill="x", side="bottom")
 
 show_paste_placeholder()
 process_test_queue()
-root.after(80, apply_initial_pane_layout)
 
 single_entry.bind("<Return>", lambda event: add_single())
 paste_text.bind("<FocusIn>", handle_paste_focus_in)
