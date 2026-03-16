@@ -7,7 +7,7 @@ import threading
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import ssl
@@ -29,6 +29,10 @@ test_result_queue = queue.Queue()
 IP_PATTERN = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 RESAMPLING = getattr(Image, "Resampling", Image)
 DEFAULT_TEST_TARGET = "https://www.google.com"
+TEST_STATUS_UNTESTED = "未测试"
+TEST_STATUS_TESTING = "测试中"
+TEST_STATUS_CONNECTED = "连通"
+TEST_STATUS_DISCONNECTED = "不通"
 SOCKS5_REPLY_MESSAGES = {
     0x01: "代理故障",
     0x02: "规则拒绝",
@@ -51,6 +55,22 @@ burtonbattis885@outlook.com GRO_28502_7Q1C3 113.201.9.110|5477|mbjs20x2|mbjs20x2
 
 日期可选，最少支持 IP|端口|用户|密码。
 直接粘贴多行数据后，点击下方“导入粘贴内容”即可。"""
+
+next_test_run_id = 0
+
+root = None
+table = None
+paste_text = None
+single_entry = None
+test_target_var = None
+test_button = None
+count_var = None
+status_var = None
+preview_canvas = None
+preview_title_var = None
+preview_meta_var = None
+preview_url_text = None
+table_menu = None
 
 
 def extract_ip_data(text):
@@ -76,11 +96,54 @@ def extract_ip_data(text):
 
 
 def build_proxy_url(ip_data, remarks):
-    base = (
-        f"socks5://{ip_data['user']}:{ip_data['pwd']}"
-        f"@{ip_data['ip']}:{ip_data['port']}"
-    )
-    return f"{base}#{remarks}" if remarks else base
+    host = ip_data["ip"]
+    try:
+        if ipaddress.ip_address(host).version == 6:
+            host = f"[{host}]"
+    except ValueError:
+        pass
+
+    user = quote(ip_data["user"], safe="")
+    password = quote(ip_data["pwd"], safe="")
+    auth = ""
+    if ip_data["user"] or ip_data["pwd"]:
+        auth = f"{user}:{password}@"
+
+    base = f"socks5://{auth}{host}:{ip_data['port']}"
+    return f"{base}#{quote(remarks, safe='')}" if remarks else base
+
+
+def get_exportable_rows(row_mapping=None):
+    source = rows if row_mapping is None else row_mapping
+    return [
+        row
+        for row in source.values()
+        if row.get("test_status") == TEST_STATUS_CONNECTED
+    ]
+
+
+def allocate_test_run_id():
+    global next_test_run_id
+
+    next_test_run_id += 1
+    return next_test_run_id
+
+
+def mark_row_pending_test(row, target_display, run_id):
+    row["target_display"] = target_display
+    row["latency"] = "-"
+    row["test_status"] = TEST_STATUS_TESTING
+    row["active_test_run_id"] = run_id
+
+
+def apply_test_result_to_row(row, latency, status, run_id):
+    if row.get("active_test_run_id") != run_id:
+        return False
+
+    row["latency"] = latency
+    row["test_status"] = status
+    row["active_test_run_id"] = None
+    return True
 
 
 def build_tree_values(ip_data, remarks, latency, status):
@@ -200,17 +263,16 @@ def add_row(text, show_warning=True):
             messagebox.showwarning("警告", f"未识别到有效代理数据:\n{raw_text}")
         return False
 
-    status = "未预览"
-    values = build_tree_values(ip_data, remarks, "-", "未测试")
+    values = build_tree_values(ip_data, remarks, "-", TEST_STATUS_UNTESTED)
     item_id = table.insert("", "end", values=values)
     rows[item_id] = {
         "ip_data": ip_data,
         "remarks": remarks,
         "original_text": raw_text,
-        "status": status,
         "latency": "-",
-        "test_status": "未测试",
+        "test_status": TEST_STATUS_UNTESTED,
         "target_display": "-",
+        "active_test_run_id": None,
     }
     update_count()
     return True
@@ -323,9 +385,9 @@ def add_single():
 
 
 def export_valid_data():
-    valid_rows = list(rows.values())
+    valid_rows = get_exportable_rows()
     if not valid_rows:
-        messagebox.showinfo("提示", "没有有效数据可导出。")
+        messagebox.showinfo("提示", "没有已测试连通的数据可导出。")
         return
 
     path = filedialog.asksaveasfilename(
@@ -339,8 +401,8 @@ def export_valid_data():
         with open(path, "w", encoding="utf-8") as file:
             for row in valid_rows:
                 file.write(f"{row['original_text']}\n")
-        messagebox.showinfo("成功", f"已导出 {len(valid_rows)} 条有效数据。")
-        update_status(f"已导出 {len(valid_rows)} 条有效数据")
+        messagebox.showinfo("成功", f"已导出 {len(valid_rows)} 条连通数据。")
+        update_status(f"已导出 {len(valid_rows)} 条连通数据")
     except Exception as exc:
         messagebox.showerror("错误", f"导出失败: {exc}")
 
@@ -564,13 +626,13 @@ def probe_target_via_proxy(ip_data, target, http_method, timeout=6):
 def test_proxy_connectivity(ip_data, target, timeout=6):
     success, latency_ms = probe_target_via_proxy(ip_data, target, "HEAD", timeout)
     if success:
-        return True, latency_ms, "连通"
+        return True, latency_ms, TEST_STATUS_CONNECTED
 
     success, latency_ms = probe_target_via_proxy(ip_data, target, "GET", timeout)
     if success:
-        return True, latency_ms, "连通"
+        return True, latency_ms, TEST_STATUS_CONNECTED
 
-    return False, None, "不通"
+    return False, None, TEST_STATUS_DISCONNECTED
 
 
 def update_test_controls():
@@ -578,29 +640,36 @@ def update_test_controls():
     test_button.config(state=state)
 
 
-def set_row_test_result(item_id, latency, status):
+def set_row_test_result(item_id, latency, status, run_id=None):
     row = rows.get(item_id)
     if not row:
-        return
+        return False
 
-    row["latency"] = latency
-    row["test_status"] = status
+    if run_id is None:
+        row["latency"] = latency
+        row["test_status"] = status
+    elif not apply_test_result_to_row(row, latency, status, run_id):
+        return False
+
     refresh_row(item_id)
 
     if current_preview_item_id == item_id:
         preview_meta_var.set(build_preview_meta(row))
+    return True
 
 
-def prepare_rows_for_test(item_ids, target_display):
+def prepare_rows_for_test(item_ids, target_display, run_id):
     for item_id in item_ids:
         row = rows.get(item_id)
         if not row:
             continue
-        row["target_display"] = target_display
-        set_row_test_result(item_id, "-", "测试中")
+        mark_row_pending_test(row, target_display, run_id)
+        refresh_row(item_id)
+        if current_preview_item_id == item_id:
+            preview_meta_var.set(build_preview_meta(row))
 
 
-def run_connectivity_tests(item_ids, target, source):
+def run_connectivity_tests(item_ids, target, source, run_id):
     success_count = 0
 
     max_workers = min(32, max(1, len(item_ids)))
@@ -621,14 +690,14 @@ def run_connectivity_tests(item_ids, target, source):
             item_id = future_map[future]
             try:
                 success, latency_ms, status = future.result()
-            except Exception as exc:
-                success, latency_ms, status = False, None, "不通"
+            except Exception:
+                success, latency_ms, status = False, None, TEST_STATUS_DISCONNECTED
             if success:
                 success_count += 1
             latency_text = f"{latency_ms} ms" if latency_ms is not None else "-"
-            test_result_queue.put(("result", item_id, latency_text, status))
+            test_result_queue.put(("result", run_id, item_id, latency_text, status))
 
-    test_result_queue.put(("done", len(item_ids), success_count, source))
+    test_result_queue.put(("done", run_id, len(future_map), success_count, source))
 
 
 def start_proxy_test(item_ids, target, scope_label, source):
@@ -637,7 +706,8 @@ def start_proxy_test(item_ids, target, scope_label, source):
     if source == "bulk" and bulk_test_running:
         return
 
-    prepare_rows_for_test(item_ids, target["display"])
+    run_id = allocate_test_run_id()
+    prepare_rows_for_test(item_ids, target["display"], run_id)
     active_test_jobs += 1
     if source == "bulk":
         bulk_test_running = True
@@ -646,7 +716,7 @@ def start_proxy_test(item_ids, target, scope_label, source):
 
     worker = threading.Thread(
         target=run_connectivity_tests,
-        args=(item_ids, target, source),
+        args=(item_ids, target, source, run_id),
         daemon=True,
     )
     worker.start()
@@ -695,10 +765,10 @@ def process_test_queue():
         while True:
             message = test_result_queue.get_nowait()
             if message[0] == "result":
-                _, item_id, latency, status = message
-                set_row_test_result(item_id, latency, status)
+                _, run_id, item_id, latency, status = message
+                set_row_test_result(item_id, latency, status, run_id=run_id)
             elif message[0] == "done":
-                _, total_count, success_count, source = message
+                _, _run_id, total_count, success_count, source = message
                 active_test_jobs = max(0, active_test_jobs - 1)
                 if source == "bulk":
                     bulk_test_running = False
@@ -839,204 +909,217 @@ def build_style():
 RIGHT_PANEL_WIDTH = 320
 
 
-root = tk.Tk()
-root.title("智能 Socks5 二维码生成工具")
-root.geometry("1100x700")
-root.minsize(1040, 620)
+def main():
+    global root, table, paste_text, single_entry, test_target_var, test_button
+    global count_var, status_var, preview_canvas, preview_title_var
+    global preview_meta_var, preview_url_text, table_menu
 
-build_style()
+    root = tk.Tk()
+    root.title("智能 Socks5 二维码生成工具")
+    root.geometry("1100x700")
+    root.minsize(1040, 620)
 
-main_frame = ttk.Frame(root, style="App.TFrame", padding=(12, 12, 12, 8))
-main_frame.pack(fill="both", expand=True)
+    build_style()
 
-toolbar_frame = ttk.Frame(main_frame, style="App.TFrame")
-toolbar_frame.pack(fill="x", pady=(0, 10))
+    main_frame = ttk.Frame(root, style="App.TFrame", padding=(12, 12, 12, 8))
+    main_frame.pack(fill="both", expand=True)
 
-ttk.Button(toolbar_frame, text="导入文件", command=import_data).pack(side="left")
-ttk.Button(toolbar_frame, text="导入粘贴内容", command=import_pasted_data).pack(side="left", padx=(8, 0))
-ttk.Button(toolbar_frame, text="预览二维码", command=preview_selected).pack(side="left", padx=(8, 0))
-ttk.Label(toolbar_frame, text="测试网站", style="Count.TLabel").pack(side="left", padx=(18, 6))
-test_target_var = tk.StringVar(value=DEFAULT_TEST_TARGET)
-test_target_entry = ttk.Entry(toolbar_frame, textvariable=test_target_var, width=28)
-test_target_entry.pack(side="left")
-test_button = ttk.Button(toolbar_frame, text="测试全部代理", command=test_all_proxies)
-test_button.pack(side="left", padx=(8, 0))
-ttk.Button(toolbar_frame, text="全选", command=select_all).pack(side="left", padx=(18, 0))
-ttk.Button(toolbar_frame, text="取消全选", command=deselect_all).pack(side="left", padx=(8, 0))
-ttk.Button(toolbar_frame, text="删除选中", command=delete_selected).pack(side="left", padx=(8, 0))
-ttk.Button(toolbar_frame, text="导出有效数据", command=export_valid_data).pack(side="left", padx=(8, 0))
+    toolbar_frame = ttk.Frame(main_frame, style="App.TFrame")
+    toolbar_frame.pack(fill="x", pady=(0, 10))
 
-content_frame = ttk.Frame(main_frame, style="App.TFrame")
-content_frame.pack(fill="both", expand=True)
-content_frame.columnconfigure(0, weight=1, minsize=680)
-content_frame.columnconfigure(1, weight=0, minsize=RIGHT_PANEL_WIDTH)
-content_frame.rowconfigure(0, weight=1)
+    ttk.Button(toolbar_frame, text="导入文件", command=import_data).pack(side="left")
+    ttk.Button(toolbar_frame, text="导入粘贴内容", command=import_pasted_data).pack(side="left", padx=(8, 0))
+    ttk.Button(toolbar_frame, text="预览二维码", command=preview_selected).pack(side="left", padx=(8, 0))
+    ttk.Label(toolbar_frame, text="测试网站", style="Count.TLabel").pack(side="left", padx=(18, 6))
+    test_target_var = tk.StringVar(value=DEFAULT_TEST_TARGET)
+    test_target_entry = ttk.Entry(toolbar_frame, textvariable=test_target_var, width=28)
+    test_target_entry.pack(side="left")
+    test_button = ttk.Button(toolbar_frame, text="测试全部代理", command=test_all_proxies)
+    test_button.pack(side="left", padx=(8, 0))
+    ttk.Button(toolbar_frame, text="全选", command=select_all).pack(side="left", padx=(18, 0))
+    ttk.Button(toolbar_frame, text="取消全选", command=deselect_all).pack(side="left", padx=(8, 0))
+    ttk.Button(toolbar_frame, text="删除选中", command=delete_selected).pack(side="left", padx=(8, 0))
+    ttk.Button(toolbar_frame, text="导出连通数据", command=export_valid_data).pack(side="left", padx=(8, 0))
 
-left_panel = ttk.Frame(content_frame, style="App.TFrame")
-left_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+    content_frame = ttk.Frame(main_frame, style="App.TFrame")
+    content_frame.pack(fill="both", expand=True)
+    content_frame.columnconfigure(0, weight=1, minsize=680)
+    content_frame.columnconfigure(1, weight=0, minsize=RIGHT_PANEL_WIDTH)
+    content_frame.rowconfigure(0, weight=1)
 
-right_panel = ttk.Frame(content_frame, style="App.TFrame", width=RIGHT_PANEL_WIDTH)
-right_panel.grid(row=0, column=1, sticky="nsew")
+    left_panel = ttk.Frame(content_frame, style="App.TFrame")
+    left_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
 
-input_card = ttk.LabelFrame(left_panel, text="数据输入", style="Card.TLabelframe", padding=10)
-input_card.pack(fill="x")
+    right_panel = ttk.Frame(content_frame, style="App.TFrame", width=RIGHT_PANEL_WIDTH)
+    right_panel.grid(row=0, column=1, sticky="nsew")
 
-single_row = ttk.Frame(input_card, style="Card.TFrame")
-single_row.pack(fill="x")
+    input_card = ttk.LabelFrame(left_panel, text="数据输入", style="Card.TLabelframe", padding=10)
+    input_card.pack(fill="x")
 
-ttk.Label(single_row, text="单条输入", style="Muted.TLabel").pack(side="left")
-single_entry = ttk.Entry(single_row)
-single_entry.pack(side="left", fill="x", expand=True, padx=(10, 8))
-ttk.Button(single_row, text="添加", command=add_single).pack(side="left")
+    single_row = ttk.Frame(input_card, style="Card.TFrame")
+    single_row.pack(fill="x")
 
-paste_container = ttk.Frame(input_card, style="Card.TFrame")
-paste_container.pack(fill="x", pady=(10, 0))
+    ttk.Label(single_row, text="单条输入", style="Muted.TLabel").pack(side="left")
+    single_entry = ttk.Entry(single_row)
+    single_entry.pack(side="left", fill="x", expand=True, padx=(10, 8))
+    ttk.Button(single_row, text="添加", command=add_single).pack(side="left")
 
-paste_text = tk.Text(
-    paste_container,
-    height=8,
-    wrap="word",
-    bd=1,
-    relief="solid",
-    padx=10,
-    pady=10,
-    font=("Segoe UI", 10),
-    fg="#1f2937",
-    bg="#fbfcfe",
-    insertbackground="#1f2937",
-)
-paste_scrollbar = ttk.Scrollbar(paste_container, orient="vertical", command=paste_text.yview)
-paste_text.configure(yscrollcommand=paste_scrollbar.set)
-paste_text.pack(side="left", fill="x", expand=True)
-paste_scrollbar.pack(side="right", fill="y")
+    paste_container = ttk.Frame(input_card, style="Card.TFrame")
+    paste_container.pack(fill="x", pady=(10, 0))
 
-paste_action_row = ttk.Frame(input_card, style="Card.TFrame")
-paste_action_row.pack(fill="x", pady=(10, 0))
+    paste_text = tk.Text(
+        paste_container,
+        height=8,
+        wrap="word",
+        bd=1,
+        relief="solid",
+        padx=10,
+        pady=10,
+        font=("Segoe UI", 10),
+        fg="#1f2937",
+        bg="#fbfcfe",
+        insertbackground="#1f2937",
+    )
+    paste_scrollbar = ttk.Scrollbar(paste_container, orient="vertical", command=paste_text.yview)
+    paste_text.configure(yscrollcommand=paste_scrollbar.set)
+    paste_text.pack(side="left", fill="x", expand=True)
+    paste_scrollbar.pack(side="right", fill="y")
 
-ttk.Button(paste_action_row, text="导入粘贴内容", command=import_pasted_data).pack(side="left")
-ttk.Button(paste_action_row, text="清空输入框", command=clear_paste_text).pack(side="left", padx=(8, 0))
-ttk.Label(
-    paste_action_row,
-    text="粘贴后说明文字会自动隐藏，清空后会自动恢复",
-    style="Muted.TLabel",
-).pack(side="right")
+    paste_action_row = ttk.Frame(input_card, style="Card.TFrame")
+    paste_action_row.pack(fill="x", pady=(10, 0))
 
-list_card = ttk.LabelFrame(left_panel, text="代理列表", style="Card.TLabelframe", padding=(8, 8, 8, 10))
-list_card.pack(fill="both", expand=True, pady=(10, 0))
+    ttk.Button(paste_action_row, text="导入粘贴内容", command=import_pasted_data).pack(side="left")
+    ttk.Button(paste_action_row, text="清空输入框", command=clear_paste_text).pack(side="left", padx=(8, 0))
+    ttk.Label(
+        paste_action_row,
+        text="粘贴后说明文字会自动隐藏，清空后会自动恢复",
+        style="Muted.TLabel",
+    ).pack(side="right")
 
-list_header = ttk.Frame(list_card, style="Card.TFrame")
-list_header.pack(fill="x", pady=(0, 8))
+    list_card = ttk.LabelFrame(left_panel, text="代理列表", style="Card.TLabelframe", padding=(8, 8, 8, 10))
+    list_card.pack(fill="both", expand=True, pady=(10, 0))
 
-count_var = tk.StringVar(value="共 0 条数据")
-ttk.Label(list_header, textvariable=count_var, style="Title.TLabel").pack(side="left")
-ttk.Label(list_header, text="双击行可直接预览二维码", style="Count.TLabel").pack(side="right")
+    list_header = ttk.Frame(list_card, style="Card.TFrame")
+    list_header.pack(fill="x", pady=(0, 8))
 
-table_frame = ttk.Frame(list_card, style="Card.TFrame")
-table_frame.pack(fill="both", expand=True)
+    count_var = tk.StringVar(value="共 0 条数据")
+    ttk.Label(list_header, textvariable=count_var, style="Title.TLabel").pack(side="left")
+    ttk.Label(list_header, text="双击行可直接预览二维码", style="Count.TLabel").pack(side="right")
 
-table_columns = ("endpoint", "user", "pwd", "date", "remarks", "latency", "status")
-table_display_columns = ("endpoint", "latency", "status", "user", "pwd", "date", "remarks")
-table = ttk.Treeview(
-    table_frame,
-    columns=table_columns,
-    displaycolumns=table_display_columns,
-    show="headings",
-    selectmode="extended",
-)
+    table_frame = ttk.Frame(list_card, style="Card.TFrame")
+    table_frame.pack(fill="both", expand=True)
 
-column_specs = {
-    "endpoint": ("IP:端口", 150, False),
-    "latency": ("延迟(ms)", 84, False),
-    "status": ("连通", 86, False),
-    "user": ("用户", 92, False),
-    "pwd": ("密码", 92, False),
-    "date": ("日期", 92, False),
-    "remarks": ("备注", 190, True),
-}
+    table_columns = ("endpoint", "user", "pwd", "date", "remarks", "latency", "status")
+    table_display_columns = ("endpoint", "latency", "status", "user", "pwd", "date", "remarks")
+    table = ttk.Treeview(
+        table_frame,
+        columns=table_columns,
+        displaycolumns=table_display_columns,
+        show="headings",
+        selectmode="extended",
+    )
 
-for column_name, (title, width, stretch) in column_specs.items():
-    table.heading(column_name, text=title)
-    table.column(column_name, width=width, stretch=stretch, anchor="w")
+    column_specs = {
+        "endpoint": ("IP:端口", 150, False),
+        "latency": ("延迟(ms)", 84, False),
+        "status": ("连通", 86, False),
+        "user": ("用户", 92, False),
+        "pwd": ("密码", 92, False),
+        "date": ("日期", 92, False),
+        "remarks": ("备注", 190, True),
+    }
 
-table_vscroll = ttk.Scrollbar(table_frame, orient="vertical", command=table.yview)
-table_hscroll = ttk.Scrollbar(table_frame, orient="horizontal", command=table.xview)
-table.configure(yscrollcommand=table_vscroll.set, xscrollcommand=table_hscroll.set)
+    for column_name, (title, width, stretch) in column_specs.items():
+        table.heading(column_name, text=title)
+        table.column(column_name, width=width, stretch=stretch, anchor="w")
 
-table.grid(row=0, column=0, sticky="nsew")
-table_vscroll.grid(row=0, column=1, sticky="ns")
-table_hscroll.grid(row=1, column=0, sticky="ew")
-table_frame.columnconfigure(0, weight=1)
-table_frame.rowconfigure(0, weight=1)
+    table_vscroll = ttk.Scrollbar(table_frame, orient="vertical", command=table.yview)
+    table_hscroll = ttk.Scrollbar(table_frame, orient="horizontal", command=table.xview)
+    table.configure(yscrollcommand=table_vscroll.set, xscrollcommand=table_hscroll.set)
 
-table_menu = tk.Menu(root, tearoff=0)
-table_menu.add_command(label="测试单条代理", command=test_single_selected_proxy)
-table_menu.add_separator()
-table_menu.add_command(label="删除选中", command=delete_selected)
+    table.grid(row=0, column=0, sticky="nsew")
+    table_vscroll.grid(row=0, column=1, sticky="ns")
+    table_hscroll.grid(row=1, column=0, sticky="ew")
+    table_frame.columnconfigure(0, weight=1)
+    table_frame.rowconfigure(0, weight=1)
 
-preview_card = ttk.LabelFrame(right_panel, text="二维码预览", style="Card.TLabelframe", padding=12)
-preview_card.pack(fill="both", expand=True, anchor="n")
+    table_menu = tk.Menu(root, tearoff=0)
+    table_menu.add_command(label="测试单条代理", command=test_single_selected_proxy)
+    table_menu.add_separator()
+    table_menu.add_command(label="删除选中", command=delete_selected)
 
-preview_title_var = tk.StringVar(value="等待选择")
-preview_meta_var = tk.StringVar(value="从左侧列表选择一条数据，再点击“预览二维码”或直接双击。")
+    preview_card = ttk.LabelFrame(right_panel, text="二维码预览", style="Card.TLabelframe", padding=12)
+    preview_card.pack(fill="both", expand=True, anchor="n")
 
-ttk.Label(preview_card, textvariable=preview_title_var, style="Title.TLabel").pack(anchor="w")
-ttk.Label(preview_card, textvariable=preview_meta_var, style="Muted.TLabel", justify=tk.LEFT, wraplength=240).pack(
-    anchor="w", pady=(6, 12)
-)
+    preview_title_var = tk.StringVar(value="等待选择")
+    preview_meta_var = tk.StringVar(value="从左侧列表选择一条数据，再点击“预览二维码”或直接双击。")
 
-preview_canvas = tk.Canvas(
-    preview_card,
-    width=240,
-    height=240,
-    bg="#ffffff",
-    bd=1,
-    relief="solid",
-    highlightthickness=0,
-)
-preview_canvas.pack()
-preview_canvas.create_text(120, 120, text="暂无二维码", fill="#7a8696", font=("Segoe UI", 11))
+    ttk.Label(preview_card, textvariable=preview_title_var, style="Title.TLabel").pack(anchor="w")
+    ttk.Label(
+        preview_card,
+        textvariable=preview_meta_var,
+        style="Muted.TLabel",
+        justify=tk.LEFT,
+        wraplength=240,
+    ).pack(anchor="w", pady=(6, 12))
 
-preview_link_row = ttk.Frame(preview_card, style="Card.TFrame")
-preview_link_row.pack(fill="x", pady=(12, 6))
+    preview_canvas = tk.Canvas(
+        preview_card,
+        width=240,
+        height=240,
+        bg="#ffffff",
+        bd=1,
+        relief="solid",
+        highlightthickness=0,
+    )
+    preview_canvas.pack()
+    preview_canvas.create_text(120, 120, text="暂无二维码", fill="#7a8696", font=("Segoe UI", 11))
 
-ttk.Label(preview_link_row, text="当前代理链接", style="Muted.TLabel").pack(side="left")
-ttk.Button(preview_link_row, text="复制链接", command=copy_preview_url).pack(side="right")
+    preview_link_row = ttk.Frame(preview_card, style="Card.TFrame")
+    preview_link_row.pack(fill="x", pady=(12, 6))
 
-preview_url_text = tk.Text(
-    preview_card,
-    height=4,
-    wrap="word",
-    bd=1,
-    relief="solid",
-    padx=8,
-    pady=8,
-    font=("Consolas", 9),
-    bg="#fbfcfe",
-    fg="#1f2937",
-)
-preview_url_text.insert("1.0", "代理链接将在这里显示")
-preview_url_text.config(state="disabled")
-preview_url_text.pack(fill="both")
+    ttk.Label(preview_link_row, text="当前代理链接", style="Muted.TLabel").pack(side="left")
+    ttk.Button(preview_link_row, text="复制链接", command=copy_preview_url).pack(side="right")
 
-status_var = tk.StringVar(value="就绪")
-status_bar = ttk.Label(root, textvariable=status_var, anchor="w", padding=(14, 6))
-status_bar.pack(fill="x", side="bottom")
+    preview_url_text = tk.Text(
+        preview_card,
+        height=4,
+        wrap="word",
+        bd=1,
+        relief="solid",
+        padx=8,
+        pady=8,
+        font=("Consolas", 9),
+        bg="#fbfcfe",
+        fg="#1f2937",
+    )
+    preview_url_text.insert("1.0", "代理链接将在这里显示")
+    preview_url_text.config(state="disabled")
+    preview_url_text.pack(fill="both")
 
-show_paste_placeholder()
-process_test_queue()
+    status_var = tk.StringVar(value="就绪")
+    status_bar = ttk.Label(root, textvariable=status_var, anchor="w", padding=(14, 6))
+    status_bar.pack(fill="x", side="bottom")
 
-single_entry.bind("<Return>", lambda event: add_single())
-paste_text.bind("<FocusIn>", handle_paste_focus_in)
-paste_text.bind("<FocusOut>", handle_paste_focus_out)
-table.bind("<Double-1>", handle_table_double_click)
-table.bind("<<TreeviewSelect>>", handle_table_select)
-table.bind("<Button-3>", show_table_context_menu)
-table.bind("<MouseWheel>", handle_table_mousewheel)
-table.bind("<Control-a>", handle_table_ctrl_a)
-table.bind("<Control-A>", handle_table_ctrl_a)
-table.bind("<Delete>", handle_delete_key)
-table.bind("<KP_Delete>", handle_delete_key)
-root.bind_all("<Delete>", handle_delete_key, add="+")
-root.bind_all("<KP_Delete>", handle_delete_key, add="+")
+    show_paste_placeholder()
+    process_test_queue()
 
-root.mainloop()
+    single_entry.bind("<Return>", lambda event: add_single())
+    paste_text.bind("<FocusIn>", handle_paste_focus_in)
+    paste_text.bind("<FocusOut>", handle_paste_focus_out)
+    table.bind("<Double-1>", handle_table_double_click)
+    table.bind("<<TreeviewSelect>>", handle_table_select)
+    table.bind("<Button-3>", show_table_context_menu)
+    table.bind("<MouseWheel>", handle_table_mousewheel)
+    table.bind("<Control-a>", handle_table_ctrl_a)
+    table.bind("<Control-A>", handle_table_ctrl_a)
+    table.bind("<Delete>", handle_delete_key)
+    table.bind("<KP_Delete>", handle_delete_key)
+    root.bind_all("<Delete>", handle_delete_key, add="+")
+    root.bind_all("<KP_Delete>", handle_delete_key, add="+")
+
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
